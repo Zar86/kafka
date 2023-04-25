@@ -16,6 +16,8 @@
  */
 package org.apache.kafka.common.utils;
 
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.BufferUnderflowException;
 import java.nio.file.StandardOpenOption;
 import java.util.AbstractMap;
@@ -1430,6 +1432,12 @@ public final class Utils {
         return Stream.of(enumClass.getEnumConstants())
                 .map(Object::toString)
                 .toArray(String[]::new);
+    }
+
+    public static void checkServerAvailability(String host, int port, int timeout) throws IOException {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(host, port), timeout);
+        }
     }
 
 }
