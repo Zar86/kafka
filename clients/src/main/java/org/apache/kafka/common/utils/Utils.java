@@ -16,6 +16,8 @@
  */
 package org.apache.kafka.common.utils;
 
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.BufferUnderflowException;
 import java.nio.file.StandardOpenOption;
 import java.util.AbstractMap;
@@ -23,7 +25,10 @@ import java.util.EnumSet;
 import java.util.Map.Entry;
 import java.util.SortedSet;
 import java.util.TreeSet;
+
+import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.network.TransferableChannel;
 import org.slf4j.Logger;
@@ -66,6 +71,12 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BinaryOperator;
@@ -1404,7 +1415,7 @@ public final class Utils {
      * Checks if a string is null, empty or whitespace only.
      * @param str a string to be checked
      * @return true if the string is null, empty or whitespace only; otherwise, return false.
-     */    
+     */
     public static boolean isBlank(String str) {
         return str == null || str.trim().isEmpty();
     }
@@ -1430,6 +1441,66 @@ public final class Utils {
         return Stream.of(enumClass.getEnumConstants())
                 .map(Object::toString)
                 .toArray(String[]::new);
+    }
+
+    public static void checkServerAvailability(String host, int port, int timeout) throws RuntimeException {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(host, port), timeout);
+        } catch (Exception e) {
+            throw new RuntimeException("Unavailable or broken connection to " + host + ":" + port, e);
+        }
+    }
+
+    public static void resetMetadataByUrlNodeUnavailability(Metadata metadata, List<InetSocketAddress> addresses) throws RuntimeException {
+        final List<Node> availableNodes = metadata.fetch().nodes();
+        if (Objects.nonNull(availableNodes) && !availableNodes.isEmpty()) {
+            final int sizeAvailableNodes = availableNodes.size();
+            if (sizeAvailableNodes == 1) {
+                final Node node = availableNodes.get(0);
+                try {
+                    Utils.checkServerAvailability(node.host(), node.port(), 3_000);
+                    return;
+                } catch (Exception e) {
+                    metadata.bootstrap(addresses);
+                    throw new RuntimeException(e);
+                }
+            } else {
+                final ExecutorService checkUrlExecutorService = Executors.newFixedThreadPool(sizeAvailableNodes, new ThreadFactory() {
+                    private final AtomicInteger threadNumber = new AtomicInteger(1);
+                    private final String namePrefix = Thread.currentThread().getName() + "-checkUrlExecutor-pool-";
+                    private final ThreadGroup group = new ThreadGroup("checkUrlGroup");
+
+                    @Override
+                    public Thread newThread(Runnable runnable) {
+                        Thread t = new Thread(this.group, runnable, this.namePrefix + this.threadNumber.getAndIncrement());
+                        t.setDaemon(false);
+                        t.setPriority(Thread.NORM_PRIORITY);
+                        return t;
+                    }
+                });
+                try {
+                    final List<Future<?>> checkUrlFutures = new ArrayList<>(sizeAvailableNodes);
+                    for (Node node : availableNodes) {
+                        final Future<?> checkUrlFuture = checkUrlExecutorService.submit(() -> {
+                            Utils.checkServerAvailability(node.host(), node.port(), 3_000);
+                        });
+                        checkUrlFutures.add(checkUrlFuture);
+                    }
+
+                    for (Future<?> checkUrlFuture : checkUrlFutures) {
+                        checkUrlFuture.get(3_500, TimeUnit.MILLISECONDS);
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                } catch (Exception e) {
+                    metadata.bootstrap(addresses);
+                    throw new RuntimeException(e);
+                } finally {
+                    checkUrlExecutorService.shutdownNow();
+                }
+            }
+        }
     }
 
 }
