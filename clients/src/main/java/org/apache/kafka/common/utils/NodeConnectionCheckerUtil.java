@@ -15,8 +15,8 @@ import java.util.concurrent.TimeUnit;
 
 public class NodeConnectionCheckerUtil {
 
-    private static final long SOCKET_TTL = TimeUnit.MINUTES.toMillis(3);
-    private static final int CONNECT_TIMEOUT = (int) TimeUnit.SECONDS.toMillis(5);
+    private static final long SOCKET_TTL = TimeUnit.MINUTES.toMillis(1);
+    private static final int CONNECT_TIMEOUT = (int) TimeUnit.SECONDS.toMillis(2);
 
     private static final ConcurrentMap<Node, SocketWrapper> connectedNodes = new ConcurrentHashMap<>();
 
