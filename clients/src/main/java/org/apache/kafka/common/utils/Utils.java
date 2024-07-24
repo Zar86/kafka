@@ -16,14 +16,20 @@
  */
 package org.apache.kafka.common.utils;
 
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.BufferUnderflowException;
 import java.nio.file.StandardOpenOption;
 import java.util.AbstractMap;
 import java.util.EnumSet;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.SortedSet;
 import java.util.TreeSet;
+
+import org.apache.kafka.clients.Metadata;
 import org.apache.kafka.common.KafkaException;
+import org.apache.kafka.common.Node;
 import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.network.TransferableChannel;
 import org.slf4j.Logger;
@@ -69,6 +75,11 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ForkJoinPool;
+import java.util.concurrent.ForkJoinWorkerThread;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BinaryOperator;
@@ -87,6 +98,16 @@ import java.util.Date;
 public final class Utils {
 
     private Utils() {}
+
+    private static final ForkJoinPool.ForkJoinWorkerThreadFactory factory = new ForkJoinPool.ForkJoinWorkerThreadFactory() {
+        @Override
+        public ForkJoinWorkerThread newThread(final ForkJoinPool pool) {
+            final ForkJoinWorkerThread worker = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
+            worker.setName("kafka-check-node-availability-" + worker.getPoolIndex());
+            return worker;
+        }
+    };
+    private static final ForkJoinPool commonPool = new ForkJoinPool(24, factory, null, false);
 
     // This matches URIs of formats: host:port and protocol:\\host:port
     // IPv6 is supported with [ip] pattern
@@ -1475,6 +1496,74 @@ public final class Utils {
         return Stream.of(enumClass.getEnumConstants())
                 .map(Object::toString)
                 .toArray(String[]::new);
+    }
+
+    public static CompletableFuture<Boolean> checkServerAvailability(final String host, final int port, final int timeout) {
+        return CompletableFuture.supplyAsync(() -> {
+            try (final Socket socket = new Socket()) {
+                socket.connect(new InetSocketAddress(host, port), timeout);
+                return true;
+            } catch (final Exception e) {
+                final String errorMsg = String.format("Unavailable or broken connection to %s:%s; Error: %s;", host, port, e.getMessage());
+                throw new RuntimeException(errorMsg, e);
+            }
+        }, commonPool);
+
+    }
+
+    /**
+     * @param availableNodes - current nodes from metadata cache
+     * @throws IOException - throws if node unavailable
+     */
+    public static void checkNodeAvailability(final List<Node> availableNodes) throws IOException {
+        final int maxRequestTimeMs = 2_500;
+        final int size = Optional.ofNullable(availableNodes)
+                .map(List::size)
+                .orElse(0);
+        if (size == 1) {
+            final Node node = availableNodes.get(0);
+            try {
+                Utils.checkServerAvailability(node.host(), node.port(), maxRequestTimeMs).get();
+            } catch (final Exception e) {
+                throw new IOException(Optional.ofNullable(e.getCause()).orElse(e));
+            }
+        } else if (size > 1) {
+            final List<CompletableFuture<Boolean>> checkFutures = new ArrayList<>(size);
+            for (final Node node : availableNodes) {
+                checkFutures.add(Utils.checkServerAvailability(node.host(), node.port(), maxRequestTimeMs));
+            }
+            int errorCounter = 0;
+            Exception resultException = null;
+            final StringBuilder errorNodesMessage = new StringBuilder(2 * size);
+            for (final CompletableFuture<Boolean> future : checkFutures) {
+                try {
+                    future.get(maxRequestTimeMs * 2, TimeUnit.MILLISECONDS);
+                } catch (final Exception e) {
+                    resultException = e;
+                    errorCounter++;
+                    errorNodesMessage.append(Optional.ofNullable(e.getCause())
+                            .map(Throwable::getMessage)
+                            .orElse(e.getMessage()));
+                    errorNodesMessage.append(' ');
+                }
+            }
+            if (Objects.nonNull(resultException) && errorCounter > Math.ceil(size * 0.5)) {
+                throw new IOException(errorNodesMessage.toString(), resultException);
+            }
+        }
+    }
+
+    public static boolean bootstrapWithIntervalDelay(final AtomicLong lastUpdateNodeTimeMs,
+                                                     final Metadata metadata,
+                                                     final List<InetSocketAddress> addresses,
+                                                     final int bootstrapIntervalMs) {
+        final long currentTimeMs = System.currentTimeMillis();
+        if (currentTimeMs - lastUpdateNodeTimeMs.get() > bootstrapIntervalMs) {
+            lastUpdateNodeTimeMs.set(currentTimeMs);
+            metadata.bootstrap(addresses);
+            return true;
+        }
+        return false;
     }
 
     /**
