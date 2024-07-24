@@ -20,15 +20,16 @@ import java.util.concurrent.TimeUnit;
 
 public class NodeConnectionCheckerUtil {
 
-    private static final long SOCKET_TTL = TimeUnit.MINUTES.toMillis(3);
-    private static final int CONNECT_TIMEOUT = (int) TimeUnit.SECONDS.toMillis(5);
+    private static final long SOCKET_TTL = TimeUnit.MINUTES.toMillis(1);
+    private static final int CONNECT_TIMEOUT = (int) TimeUnit.SECONDS.toMillis(2);
+    private static final int THREAD_TIMEOUT = CONNECT_TIMEOUT + 500;
 
     private static final ForkJoinPool.ForkJoinWorkerThreadFactory factory = pool -> {
         final ForkJoinWorkerThread worker = ForkJoinPool.defaultForkJoinWorkerThreadFactory.newThread(pool);
         worker.setName("kafka-check-node-availability-" + worker.getPoolIndex());
         return worker;
     };
-    private static final ForkJoinPool commonPool = new ForkJoinPool(128, factory, null, false);
+    private static final ForkJoinPool FORK_JOIN_COMMON_POOL = new ForkJoinPool(32, factory, null, false);
 
     private static final ConcurrentMap<Node, SocketWrapper> connectedNodes = new ConcurrentHashMap<>();
 
@@ -37,13 +38,18 @@ public class NodeConnectionCheckerUtil {
      * @throws IOException - throws if node unavailable
      */
     public static void checkNodesAvailability(final Collection<Node> nodes) throws Exception {
+        if (Objects.isNull(nodes) || nodes.isEmpty()) {
+            return;
+        }
         restoreConnectionsTtl();
         final List<CompletableFuture<Void>> checkFutures = new ArrayList<>(nodes.size());
         for (final Node node : nodes) {
-            checkFutures.add(CompletableFuture.runAsync(() -> checkNodeAvailability(node), commonPool));
+            if (Objects.nonNull(node)) {
+                checkFutures.add(CompletableFuture.runAsync(() -> checkNodeAvailability(node), FORK_JOIN_COMMON_POOL));
+            }
         }
         for (final CompletableFuture<Void> future : checkFutures) {
-            future.get(CONNECT_TIMEOUT, TimeUnit.MILLISECONDS);
+            future.get(THREAD_TIMEOUT, TimeUnit.MILLISECONDS);
         }
     }
 
@@ -84,6 +90,9 @@ public class NodeConnectionCheckerUtil {
     }
 
     private static void sendPing(final Node node, final Socket socket) {
+        if (Objects.isNull(socket)) {
+            return;
+        }
         try {
             socket.sendUrgentData(1);
         } catch (final IOException e) {
